@@ -47,6 +47,18 @@ jobs:
         run: cargo build --tests --features ansi_logs
       - name: cargo test ansi
         run: cargo test --features ansi_logs
+      - name: cargo test (no default features)
+        run: cargo test --no-default-features
+      - name: cargo test otel-0-28
+        run: cargo test --no-default-features --features otel-0-28
+      - name: cargo test otel-0-29
+        run: cargo test --no-default-features --features otel-0-29
+      - name: cargo test otel-0-30
+        run: cargo test --no-default-features --features otel-0-30
+      - name: cargo test otel-0-31
+        run: cargo test --no-default-features --features otel-0-31
+      - name: cargo test otel-0-32
+        run: cargo test --no-default-features --features otel-0-32
 
   deny-check:
     name: cargo-deny

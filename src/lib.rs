@@ -16,6 +16,14 @@
 #![deny(unreachable_pub)]
 
 mod formatter;
+#[cfg(any(
+    feature = "otel-0-28",
+    feature = "otel-0-29",
+    feature = "otel-0-30",
+    feature = "otel-0-31",
+    feature = "otel-0-32"
+))]
+mod otel;
 mod serializer;
 
 pub use crate::formatter::builder::{builder, Builder};

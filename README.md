@@ -28,6 +28,10 @@ key=value otherkey="value with spaces" third="with escaped \"chars\""
 
 There is no strict standard for the format, but it was first documented in [this article](https://brandur.org/logfmt) by Brandur Leach.
 
+## Features
+
+- **`otel`** (optional): When enabled (default: `otel-0-32`), each log line can include OpenTelemetry `trace_id` and `span_id` by reading `OtelData` from the current span's extensions. Enable the feature that matches your [tracing-opentelemetry](https://crates.io/crates/tracing-opentelemetry) version: **`otel-0-28`**, **`otel-0-29`**, **`otel-0-30`**, **`otel-0-31`**, or **`otel-0-32`** (or **`otel`**, which implies 0.32). Use `.with_otel_span_ids(true)` (default when an otel feature is on) or `.with_otel_span_ids(false)` to disable.
+
 ## Contribution
 
 [![Contributor Covenant](https://img.shields.io/badge/contributor%20covenant-v1.4-ff69b4.svg)](CODE_OF_CONDUCT.md)

@@ -84,6 +84,25 @@ impl Builder {
         self.events.with_thread_ids = enable;
         self
     }
+
+    /// Enable including OpenTelemetry `trace_id` and `span_id` in log output.
+    ///
+    /// When enabled and an `otel-0-*` feature is set, the formatter reads
+    /// `OtelData` from the current span's extensions and adds `trace_id` and `span_id` 
+    /// keys to each log line. Enable the feature that matches your tracing-opentelemetry 
+    /// version (otel-0-28, otel-0-29, otel-0-30, otel-0-31, or otel-0-32).
+    #[cfg(any(
+        feature = "otel-0-28",
+        feature = "otel-0-29",
+        feature = "otel-0-30",
+        feature = "otel-0-31",
+        feature = "otel-0-32"
+    ))]
+    pub fn with_otel_span_ids(mut self, enable: bool) -> Self {
+        self.events.with_otel_span_ids = enable;
+        self
+    }
+
     #[cfg(feature = "ansi_logs")]
     pub fn with_ansi_color(mut self, enable: bool) -> Self {
         self.events.with_ansi_color = enable;

@@ -44,6 +44,14 @@ pub struct EventsFormatter {
     pub(crate) with_timestamp: bool,
     pub(crate) with_thread_names: bool,
     pub(crate) with_thread_ids: bool,
+    #[cfg(any(
+        feature = "otel-0-28",
+        feature = "otel-0-29",
+        feature = "otel-0-30",
+        feature = "otel-0-31",
+        feature = "otel-0-32"
+    ))]
+    pub(crate) with_otel_span_ids: bool,
     #[cfg(feature = "ansi_logs")]
     pub(crate) with_ansi_color: bool,
 }
@@ -60,6 +68,14 @@ impl Default for EventsFormatter {
             with_timestamp: true,
             with_thread_names: false,
             with_thread_ids: false,
+            #[cfg(any(
+                feature = "otel-0-28",
+                feature = "otel-0-29",
+                feature = "otel-0-30",
+                feature = "otel-0-31",
+                feature = "otel-0-32"
+            ))]
+            with_otel_span_ids: true,
             #[cfg(feature = "ansi_logs")]
             with_ansi_color: default_enable_ansi_color(),
         }
@@ -212,6 +228,24 @@ where
 
             if self.with_thread_ids {
                 serializer.serialize_entry_no_quote("thread_id", current_thread_id())?;
+            }
+
+            #[cfg(any(
+                feature = "otel-0-28",
+                feature = "otel-0-29",
+                feature = "otel-0-30",
+                feature = "otel-0-31",
+                feature = "otel-0-32"
+            ))]
+            if self.with_otel_span_ids {
+                if let Some(span) = ctx.lookup_current() {
+                    if let Some((trace_id, span_id)) =
+                        crate::otel::trace_id_span_id_from_span(&span)
+                    {
+                        serializer.serialize_entry("trace_id", &trace_id)?;
+                        serializer.serialize_entry("span_id", &span_id)?;
+                    }
+                }
             }
 
             let span = if self.with_span_name || self.with_span_path {
@@ -864,6 +898,235 @@ mod tests {
                 content,
                 "level=info target=tracing_logfmt::formatter::tests::ansi message=message\n"
             );
+        }
+    }
+
+    /// Tests for OpenTelemetry trace_id/span_id extraction (otel-0-* features).
+    #[cfg(any(
+        feature = "otel-0-28",
+        feature = "otel-0-29",
+        feature = "otel-0-30",
+        feature = "otel-0-31",
+        feature = "otel-0-32"
+    ))]
+    mod otel {
+        use super::*;
+        use tracing::subscriber;
+
+        /// With otel span ids disabled, output must not contain trace_id= or span_id=.
+        #[test]
+        fn otel_span_ids_disabled() {
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder::builder()
+                .with_otel_span_ids(false)
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            subscriber::with_default(subscriber, || {
+                let _span = info_span!("some_span").entered();
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+            contains!(
+                content,
+                ["level=info", "message=message"],
+                ["trace_id=", "span_id="]
+            );
+        }
+
+        /// Without tracing-opentelemetry layer there is no OtelData; output has no trace_id/span_id.
+        #[test]
+        fn otel_span_ids_without_otel_layer_no_otel_data() {
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder::builder()
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            subscriber::with_default(subscriber, || {
+                let _span = info_span!("plain_span").entered();
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+            assert!(content.contains("level=info"), "{}", content);
+            assert!(
+                !content.contains("trace_id="),
+                "expected no trace_id without OtelData: {}",
+                content
+            );
+            assert!(
+                !content.contains("span_id="),
+                "expected no span_id without OtelData: {}",
+                content
+            );
+        }
+
+        /// With tracing-opentelemetry layer (0.28) and noop tracer, trace_id and span_id appear in output.
+        #[cfg(feature = "otel-0-28")]
+        #[test]
+        fn otel_span_ids_with_tracing_opentelemetry_layer_0_28() {
+            use opentelemetry_0_27::trace::{noop::NoopTracerProvider, TracerProvider};
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::Registry;
+
+            let mock_writer = MockMakeWriter::new();
+            let tracer = NoopTracerProvider::new().tracer("test");
+            let otel_layer = tracing_opentelemetry_0_28::layer().with_tracer(tracer);
+            let fmt_layer = builder::builder().layer().with_writer(mock_writer.clone());
+            let subscriber = Registry::default().with(otel_layer).with(fmt_layer);
+
+            subscriber::with_default(subscriber, || {
+                let _span = tracing::info_span!("otel_span").entered();
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+            assert!(
+                content.contains("trace_id="),
+                "expected trace_id in output: {}",
+                content
+            );
+            assert!(
+                content.contains("span_id="),
+                "expected span_id in output: {}",
+                content
+            );
+            assert!(content.contains("level=info"), "{}", content);
+        }
+
+        /// With tracing-opentelemetry layer (0.29) and noop tracer, trace_id and span_id appear in output.
+        #[cfg(feature = "otel-0-29")]
+        #[test]
+        fn otel_span_ids_with_tracing_opentelemetry_layer_0_29() {
+            use opentelemetry_0_28::trace::{noop::NoopTracerProvider, TracerProvider};
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::Registry;
+
+            let mock_writer = MockMakeWriter::new();
+            let tracer = NoopTracerProvider::new().tracer("test");
+            let otel_layer = tracing_opentelemetry_0_29::layer().with_tracer(tracer);
+            let fmt_layer = builder::builder().layer().with_writer(mock_writer.clone());
+            let subscriber = Registry::default().with(otel_layer).with(fmt_layer);
+
+            subscriber::with_default(subscriber, || {
+                let _span = tracing::info_span!("otel_span").entered();
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+            assert!(
+                content.contains("trace_id="),
+                "expected trace_id in output: {}",
+                content
+            );
+            assert!(
+                content.contains("span_id="),
+                "expected span_id in output: {}",
+                content
+            );
+            assert!(content.contains("level=info"), "{}", content);
+        }
+
+        /// With tracing-opentelemetry layer (0.30) and noop tracer, trace_id and span_id appear in output.
+        #[cfg(feature = "otel-0-30")]
+        #[test]
+        fn otel_span_ids_with_tracing_opentelemetry_layer_0_30() {
+            use opentelemetry_0_29::trace::{noop::NoopTracerProvider, TracerProvider};
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::Registry;
+
+            let mock_writer = MockMakeWriter::new();
+            let tracer = NoopTracerProvider::new().tracer("test");
+            let otel_layer = tracing_opentelemetry_0_30::layer().with_tracer(tracer);
+            let fmt_layer = builder::builder().layer().with_writer(mock_writer.clone());
+            let subscriber = Registry::default().with(otel_layer).with(fmt_layer);
+
+            subscriber::with_default(subscriber, || {
+                let _span = tracing::info_span!("otel_span").entered();
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+            assert!(
+                content.contains("trace_id="),
+                "expected trace_id in output: {}",
+                content
+            );
+            assert!(
+                content.contains("span_id="),
+                "expected span_id in output: {}",
+                content
+            );
+            assert!(content.contains("level=info"), "{}", content);
+        }
+
+        /// With tracing-opentelemetry layer (0.31) and noop tracer, trace_id and span_id appear in output.
+        #[cfg(feature = "otel-0-31")]
+        #[test]
+        fn otel_span_ids_with_tracing_opentelemetry_layer_0_31() {
+            use opentelemetry_0_30::trace::{noop::NoopTracerProvider, TracerProvider};
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::Registry;
+
+            let mock_writer = MockMakeWriter::new();
+            let tracer = NoopTracerProvider::new().tracer("test");
+            let otel_layer = tracing_opentelemetry_0_31::layer().with_tracer(tracer);
+            let fmt_layer = builder::builder().layer().with_writer(mock_writer.clone());
+            let subscriber = Registry::default().with(otel_layer).with(fmt_layer);
+
+            subscriber::with_default(subscriber, || {
+                let _span = tracing::info_span!("otel_span").entered();
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+            assert!(
+                content.contains("trace_id="),
+                "expected trace_id in output: {}",
+                content
+            );
+            assert!(
+                content.contains("span_id="),
+                "expected span_id in output: {}",
+                content
+            );
+            assert!(content.contains("level=info"), "{}", content);
+        }
+
+        /// With tracing-opentelemetry layer (0.32) and noop tracer, trace_id and span_id appear in output.
+        #[cfg(feature = "otel-0-32")]
+        #[test]
+        fn otel_span_ids_with_tracing_opentelemetry_layer() {
+            use opentelemetry::trace::{noop::NoopTracerProvider, TracerProvider};
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::Registry;
+
+            let mock_writer = MockMakeWriter::new();
+            let tracer = NoopTracerProvider::new().tracer("test");
+            let otel_layer = tracing_opentelemetry_0_32::layer().with_tracer(tracer);
+            let fmt_layer = builder::builder().layer().with_writer(mock_writer.clone());
+            let subscriber = Registry::default().with(otel_layer).with(fmt_layer);
+
+            subscriber::with_default(subscriber, || {
+                let _span = tracing::info_span!("otel_span").entered();
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+            assert!(
+                content.contains("trace_id="),
+                "expected trace_id in output: {}",
+                content
+            );
+            assert!(
+                content.contains("span_id="),
+                "expected span_id in output: {}",
+                content
+            );
+            assert!(content.contains("level=info"), "{}", content);
         }
     }
 }
