@@ -72,6 +72,65 @@ fn default_enable_ansi_color() -> bool {
     std::io::stdout().is_terminal()
 }
 
+/// Gets the current thread id as an integer
+///
+/// This only supports the normal platforms here (Linux, Windows, Apple).
+/// For anything else like WASM we just return 0.
+///
+/// Note that a Rust `ThreadId` is actually just a process specific atomic,
+/// completely unrelated to the thread id assigned by the operating system, but
+/// we use the operating system one, at least until they stabilize
+/// <https://doc.rust-lang.org/std/thread/struct.ThreadId.html#method.as_u64>
+#[inline]
+#[allow(unsafe_code)]
+fn current_thread_id() -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        #[link(name = "c")]
+        unsafe extern "C" {
+            safe fn gettid() -> i32;
+        }
+
+        gettid() as _
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "kernel32", kind = "raw-dylib")]
+        unsafe extern "system" {
+            safe fn GetCurrentThreadId() -> u32;
+        }
+
+        GetCurrentThreadId() as _
+    }
+
+    #[cfg(target_vendor = "apple")]
+    {
+        #[link(name = "c")]
+        unsafe extern "C" {
+            // technically isn't safe since it accepts a pointer, but we only
+            // have a single use that keeps the pointee on the stack
+            safe fn pthread_threadid_np(thread: usize, id: *mut u64) -> i32;
+        }
+
+        let mut id = 0;
+        if pthread_threadid_np(0, &mut id) != 0 {
+            id = 0;
+        }
+
+        id
+    }
+
+    #[cfg(not(any(
+        any(target_os = "linux", target_os = "android"),
+        target_os = "windows",
+        target_vendor = "apple"
+    )))]
+    {
+        0
+    }
+}
+
 impl<S, N> FormatEvent<S, N> for EventsFormatter
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
@@ -142,24 +201,17 @@ where
             // Use same logic as tracing-subscriber for thread names and ids
             // https://github.com/tokio-rs/tracing/blob/efc690fa6bd1d9c3a57528b9bc8ac80504a7a6ed/tracing-subscriber/src/fmt/format/json.rs#L306
             if self.with_thread_names {
-                let current_thread = std::thread::current();
-                match current_thread.name() {
-                    Some(name) => {
-                        serializer.serialize_entry("thread.name", name)?;
-                    }
+                if let Some(name) = std::thread::current().name() {
+                    serializer.serialize_entry("thread_name", name)?;
+                } else if !self.with_thread_ids {
                     // fall-back to thread id when name is absent and ids are not enabled
-                    None if !self.with_thread_ids => {
-                        serializer.serialize_entry(
-                            "thread.name",
-                            &format!("{:?}", current_thread.id()),
-                        )?;
-                    }
-                    _ => {}
+                    serializer
+                        .serialize_entry("thread_name", &format!("{}", current_thread_id()))?;
                 }
             }
 
             if self.with_thread_ids {
-                serializer.serialize_entry_no_quote("thread.id", std::thread::current().id())?;
+                serializer.serialize_entry_no_quote("thread_id", current_thread_id())?;
             }
 
             let span = if self.with_span_name || self.with_span_path {
@@ -374,6 +426,7 @@ mod tests {
     };
 
     use tracing::info_span;
+    #[allow(unused_imports)]
     use tracing_subscriber::fmt::{MakeWriter, SubscriberBuilder};
 
     use super::*;
@@ -424,368 +477,393 @@ mod tests {
         }
     }
 
-    fn subscriber() -> SubscriberBuilder<FieldsFormatter, EventsFormatter> {
-        builder::builder().subscriber_builder()
+    macro_rules! contains {
+        ($content:expr, [$($item:expr),+$(,)?], [$($neg:expr),*$(,)?]) => {
+            eprintln!("{}", $content);
+
+            $(
+                assert!($content.contains($item), "failed to find expected string '{}'", $item);
+            )+
+
+            $(
+                assert!(!$content.contains($neg), "found unexpected string '{}'", $neg);
+            )*
+        }
     }
 
-    #[test]
     #[cfg(not(feature = "ansi_logs"))]
-    fn test_enable_thread_name_and_id() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = builder::builder()
-            .with_thread_names(true)
-            .with_thread_ids(true)
-            .subscriber_builder()
-            .with_writer(mock_writer.clone())
-            .finish();
-
-        std::thread::Builder::new()
-            .name("worker-1".to_string())
-            .spawn(move || {
-                subscriber::with_default(subscriber, || {
-                    tracing::info!("message");
-                });
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-
-        let content = mock_writer.get_content();
-        println!("{:?}", content);
-        assert!(content.contains("thread.name=worker-1"));
-        assert!(content.contains("thread.id="));
-    }
-
-    #[test]
-    #[cfg(not(feature = "ansi_logs"))]
-    fn test_span_and_span_path_with_quoting() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = subscriber().with_writer(mock_writer.clone()).finish();
-
-        subscriber::with_default(subscriber, || {
-            let _top = info_span!("top").entered();
-            // the ' ' requires quoting
-            let _middle = info_span!("mid dle").entered();
-            let _bottom = info_span!("bottom").entered();
-
-            tracing::info!("message");
-        });
-
-        let content = mock_writer.get_content();
-
-        println!("{:?}", content);
-        assert!(content.contains("span=bottom"));
-        assert!(content.contains("span_path=\"top>mid dle>bottom\""));
-        assert!(content.contains("info"));
-        assert!(content.contains("ts=20"));
-    }
-
-    #[test]
-    #[cfg(not(feature = "ansi_logs"))]
-    fn test_span_and_span_path_without_quoting() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = subscriber().with_writer(mock_writer.clone()).finish();
-
-        subscriber::with_default(subscriber, || {
-            let _top = info_span!("top").entered();
-            let _middle = info_span!("middle").entered();
-            let _bottom = info_span!("bottom").entered();
-
-            tracing::info!("message");
-        });
-
-        let content = mock_writer.get_content();
-
-        println!("{:?}", content);
-        assert!(content.contains("span=bottom"));
-        assert!(content.contains("span_path=top>middle>bottom"));
-        assert!(content.contains("info"));
-        assert!(content.contains("ts=20"));
-    }
-
-    #[test]
-    #[cfg(not(feature = "ansi_logs"))]
-    fn test_disable_span_and_span_path() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = builder::builder()
-            .with_span_name(false)
-            .with_span_path(false)
-            .subscriber_builder()
-            .with_writer(mock_writer.clone())
-            .finish();
-
-        subscriber::with_default(subscriber, || {
-            let _top = info_span!("top").entered();
-            let _middle = info_span!("middle").entered();
-            let _bottom = info_span!("bottom").entered();
-
-            tracing::info!("message");
-        });
-
-        let content = mock_writer.get_content();
-
-        println!("{:?}", content);
-        assert!(!content.contains("span="));
-        assert!(!content.contains("span_path="));
-        assert!(content.contains("level=info"));
-        assert!(content.contains("ts=20"));
-    }
-
-    #[test]
-    #[cfg(feature = "ansi_logs")]
-    fn test_disable_ansi_color() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = builder::builder()
-            // disable timestamp so it can be asserted
-            .with_timestamp(false)
-            .with_ansi_color(false)
-            .subscriber_builder()
-            .with_writer(mock_writer.clone())
-            .finish();
-
-        subscriber::with_default(subscriber, || {
-            tracing::info!("message");
-        });
-
-        let content = mock_writer.get_content();
-
-        // assert that there is no ansi color sequences
-        assert_eq!(
-            content,
-            "level=info target=tracing_logfmt::formatter::tests message=message\n"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "ansi_logs")]
-    fn test_enable_thread_name_and_id() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = builder::builder()
-            .with_thread_names(true)
-            .with_thread_ids(true)
-            .subscriber_builder()
-            .with_writer(mock_writer.clone())
-            .finish();
-
-        std::thread::Builder::new()
-            .name("worker-1".to_string())
-            .spawn(move || {
-                subscriber::with_default(subscriber, || {
-                    tracing::info!("message");
-                });
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-
-        let content = mock_writer.get_content();
-
-        let thread_name_prefix = make_ansi_key_value("thread.name", "=");
-        let thread_id_prefix = make_ansi_key_value("thread.id", "=");
-
-        println!("{:?}", content);
-        assert!(content.contains(&(thread_name_prefix + "worker-1")));
-        assert!(content.contains(&thread_id_prefix));
-    }
-
-    #[test]
-    #[cfg(feature = "ansi_logs")]
-    fn test_span_and_span_path_with_quoting() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = subscriber().with_writer(mock_writer.clone()).finish();
-
-        subscriber::with_default(subscriber, || {
-            let _top = info_span!("top").entered();
-            // the ' ' requires quoting
-            let _middle = info_span!("mid dle").entered();
-            let _bottom = info_span!("bottom").entered();
-
-            tracing::info!("message");
-        });
-
-        let content = mock_writer.get_content();
-
-        let span = make_ansi_key_value("span", "=bottom");
-        let span_path = make_ansi_key_value("span_path", "=\"top>mid dle>bottom\"");
-        let ts = make_ansi_key_value("ts", "=20");
-
-        println!("{:?}", content);
-        assert!(content.contains(&span));
-        assert!(content.contains(&span_path));
-        assert!(content.contains("info"));
-        assert!(content.contains(&ts));
-    }
-    #[test]
-    #[cfg(feature = "ansi_logs")]
-    fn test_span_and_span_path_without_quoting() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = subscriber().with_writer(mock_writer.clone()).finish();
-
-        subscriber::with_default(subscriber, || {
-            let _top = info_span!("top").entered();
-            let _middle = info_span!("middle").entered();
-            let _bottom = info_span!("bottom").entered();
-
-            tracing::info!("message");
-        });
-
-        let content = mock_writer.get_content();
-
-        let span = make_ansi_key_value("span", "=bottom");
-        let span_path = make_ansi_key_value("span_path", "=top>middle>bottom");
-        let ts = make_ansi_key_value("ts", "=20");
-
-        println!("{}", content);
-        assert!(content.contains(&span));
-        assert!(content.contains(&span_path));
-        assert!(content.contains("info"));
-        assert!(content.contains(&ts));
-    }
-
-    #[test]
-    #[cfg(feature = "ansi_logs")]
-    fn test_disable_span_and_span_path() {
-        use nu_ansi_term::Color;
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = builder::builder()
-            .with_span_name(false)
-            .with_span_path(false)
-            .subscriber_builder()
-            .with_writer(mock_writer.clone())
-            .finish();
-
-        subscriber::with_default(subscriber, || {
-            let _top = info_span!("top").entered();
-            let _middle = info_span!("middle").entered();
-            let _bottom = info_span!("bottom").entered();
-
-            tracing::info!("message");
-        });
-
-        let content = mock_writer.get_content();
-        let message = make_ansi_key_value("message", "=message");
-        let target = make_ansi_key_value("target", "=tracing_logfmt::formatter::tests");
-        let ts = make_ansi_key_value("ts", "=");
-
-        println!("{}", content);
-        assert!(!content.contains("span="));
-        assert!(!content.contains("span_path="));
-        assert!(content.contains(&Color::Green.bold().paint("info").to_string()));
-        assert!(content.contains(&ts));
-        assert!(content.contains(&target));
-        assert!(content.contains(&message));
-    }
-
-    #[test]
-    #[cfg(all(not(feature = "ansi_logs"), windows))]
-    fn test_enable_location() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = builder::builder()
-            .with_location(true)
-            .subscriber_builder()
-            .with_writer(mock_writer.clone())
-            .finish();
-
-        subscriber::with_default(subscriber, || {
-            let _top = info_span!("top").entered();
-            let _middle = info_span!("middle").entered();
-            let _bottom = info_span!("bottom").entered();
-
-            tracing::info!("message");
-        });
-
-        let content = mock_writer.get_content();
-        let split = content.split(r"location=src\formatter.rs:").last().unwrap();
-        let line = &split[..3];
-        assert!(line.parse::<u32>().is_ok());
-
-        println!("{}", content);
-        assert!(content.contains(r"location=src\formatter.rs:"));
-        assert!(content.contains("info"));
-    }
-
-    #[test]
-    #[cfg(all(not(feature = "ansi_logs"), not(windows)))]
-    fn test_enable_location() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = builder::builder()
-            .with_location(true)
-            .subscriber_builder()
-            .with_writer(mock_writer.clone())
-            .finish();
-
-        subscriber::with_default(subscriber, || {
-            let _top = info_span!("top").entered();
-            let _middle = info_span!("middle").entered();
-            let _bottom = info_span!("bottom").entered();
-
-            tracing::info!("message");
-        });
-
-        let content = mock_writer.get_content();
-        let split = content.split("location=src/formatter.rs:").last().unwrap();
-        let line = &split[..3];
-        assert!(line.parse::<u32>().is_ok());
-
-        println!("{}", content);
-        assert!(content.contains("location=src/formatter.rs:"));
-        assert!(content.contains("info"));
-    }
-
-    #[test]
-    #[cfg(not(feature = "ansi_logs"))]
-    fn test_enable_module_path() {
-        use tracing::subscriber;
-
-        let mock_writer = MockMakeWriter::new();
-        let subscriber = builder::builder()
-            .with_module_path(true)
-            .subscriber_builder()
-            .with_writer(mock_writer.clone())
-            .finish();
-
-        subscriber::with_default(subscriber, || {
-            let _top = info_span!("top").entered();
-            let _middle = info_span!("middle").entered();
-            let _bottom = info_span!("bottom").entered();
-
-            tracing::info!("message");
-        });
-
-        let content = mock_writer.get_content();
-
-        println!("{}", content);
-        assert!(content.contains("module_path=tracing_logfmt::formatter::tests"));
-        assert!(content.contains("info"));
+    mod no_ansi {
+        use super::*;
+
+        fn subscriber() -> SubscriberBuilder<FieldsFormatter, EventsFormatter> {
+            builder::builder().subscriber_builder()
+        }
+
+        #[test]
+        fn enable_thread_name_and_id() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder::builder()
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            std::thread::Builder::new()
+                .name("worker-1".to_string())
+                .spawn(move || {
+                    subscriber::with_default(subscriber, || {
+                        tracing::info!("message");
+                    });
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+
+            let content = mock_writer.get_content();
+            contains!(content, ["thread_name=worker-1", "thread_id="], []);
+        }
+
+        #[test]
+        fn span_and_span_path_with_quoting() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = subscriber().with_writer(mock_writer.clone()).finish();
+
+            subscriber::with_default(subscriber, || {
+                let _top = info_span!("top").entered();
+                // the ' ' requires quoting
+                let _middle = info_span!("mid dle").entered();
+                let _bottom = info_span!("bottom").entered();
+
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+
+            contains!(
+                content,
+                [
+                    "span=bottom",
+                    "span_path=\"top>mid dle>bottom\"",
+                    "info",
+                    "ts=20"
+                ],
+                []
+            );
+        }
+
+        #[test]
+        fn span_and_span_path_without_quoting() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = subscriber().with_writer(mock_writer.clone()).finish();
+
+            subscriber::with_default(subscriber, || {
+                let _top = info_span!("top").entered();
+                let _middle = info_span!("middle").entered();
+                let _bottom = info_span!("bottom").entered();
+
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+
+            contains!(
+                content,
+                [
+                    "span=bottom",
+                    "span_path=top>middle>bottom",
+                    "info",
+                    "ts=20"
+                ],
+                []
+            );
+        }
+
+        #[test]
+        fn disable_span_and_span_path() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder::builder()
+                .with_span_name(false)
+                .with_span_path(false)
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            subscriber::with_default(subscriber, || {
+                let _top = info_span!("top").entered();
+                let _middle = info_span!("middle").entered();
+                let _bottom = info_span!("bottom").entered();
+
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+
+            contains!(content, ["level=info", "ts=20"], ["span=", "span_path="]);
+        }
+
+        #[test]
+        fn enable_module_path() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder::builder()
+                .with_module_path(true)
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            subscriber::with_default(subscriber, || {
+                let _top = info_span!("top").entered();
+                let _middle = info_span!("middle").entered();
+                let _bottom = info_span!("bottom").entered();
+
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+
+            contains!(
+                content,
+                ["module_path=tracing_logfmt::formatter::tests", "info"],
+                []
+            );
+        }
+
+        #[test]
+        #[cfg(not(windows))]
+        fn enable_location() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder::builder()
+                .with_location(true)
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            subscriber::with_default(subscriber, || {
+                let _top = info_span!("top").entered();
+                let _middle = info_span!("middle").entered();
+                let _bottom = info_span!("bottom").entered();
+
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+            let split = content.split("location=src/formatter.rs:").last().unwrap();
+            let line = &split[..3];
+            assert!(line.parse::<u32>().is_ok());
+
+            contains!(content, ["location=src/formatter.rs:", "info"], []);
+        }
+
+        #[test]
+        #[cfg(windows)]
+        fn enable_location() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder::builder()
+                .with_location(true)
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            subscriber::with_default(subscriber, || {
+                let _top = info_span!("top").entered();
+                let _middle = info_span!("middle").entered();
+                let _bottom = info_span!("bottom").entered();
+
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+            let split = content.split(r"location=src\formatter.rs:").last().unwrap();
+            let line = &split[..3];
+            assert!(line.parse::<u32>().is_ok());
+
+            contains!(content, [r"location=src\formatter.rs:", "info"], []);
+        }
     }
 
     #[cfg(feature = "ansi_logs")]
-    fn make_ansi_key_value(key: &str, value: &str) -> String {
-        use nu_ansi_term::Color;
-        let mut key = Color::Rgb(109, 139, 140).bold().paint(key).to_string();
-        key.push_str(value);
-        key
+    mod ansi {
+        use super::*;
+
+        fn make_ansi_key_value(key: &str, value: &str) -> String {
+            use nu_ansi_term::Color;
+            let mut key = Color::Rgb(109, 139, 140).bold().paint(key).to_string();
+            key.push_str(value);
+            key
+        }
+
+        // We use this since locally you'll default to true for ansi colors, but
+        // CI will get auto-detected as not a terminal, disabling colors and failing tests
+        fn builder() -> builder::Builder {
+            builder::builder().with_ansi_color(true)
+        }
+
+        #[test]
+        fn disable_span_and_span_path() {
+            use nu_ansi_term::Color;
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder()
+                .with_span_name(false)
+                .with_span_path(false)
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            subscriber::with_default(subscriber, || {
+                let _top = info_span!("top").entered();
+                let _middle = info_span!("middle").entered();
+                let _bottom = info_span!("bottom").entered();
+
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+            let message = make_ansi_key_value("message", "=message");
+            let target = make_ansi_key_value("target", "=tracing_logfmt::formatter::tests");
+            let ts = make_ansi_key_value("ts", "=");
+
+            contains!(
+                content,
+                [
+                    &Color::Green.bold().paint("info").to_string(),
+                    &ts,
+                    &target,
+                    &message
+                ],
+                ["span=", "span_path="]
+            );
+        }
+
+        #[test]
+        fn span_and_span_path_without_quoting() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder()
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            subscriber::with_default(subscriber, || {
+                let _top = info_span!("top").entered();
+                let _middle = info_span!("middle").entered();
+                let _bottom = info_span!("bottom").entered();
+
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+
+            let span = make_ansi_key_value("span", "=bottom");
+            let span_path = make_ansi_key_value("span_path", "=top>middle>bottom");
+            let ts = make_ansi_key_value("ts", "=20");
+
+            contains!(content, [&span, &span_path, "info", &ts], []);
+        }
+
+        #[test]
+        fn span_and_span_path_with_quoting() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder()
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            subscriber::with_default(subscriber, || {
+                let _top = info_span!("top").entered();
+                // the ' ' requires quoting
+                let _middle = info_span!("mid dle").entered();
+                let _bottom = info_span!("bottom").entered();
+
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+
+            let span = make_ansi_key_value("span", "=bottom");
+            let span_path = make_ansi_key_value("span_path", "=\"top>mid dle>bottom\"");
+            let ts = make_ansi_key_value("ts", "=20");
+
+            contains!(content, [&span, &span_path, "info", &ts], []);
+        }
+
+        #[test]
+        fn enable_thread_name_and_id() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder()
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            std::thread::Builder::new()
+                .name("worker-1".to_string())
+                .spawn(move || {
+                    subscriber::with_default(subscriber, || {
+                        tracing::info!("message");
+                    });
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+
+            let content = mock_writer.get_content();
+
+            let thread_name_prefix = make_ansi_key_value("thread_name", "=");
+            let thread_id_prefix = make_ansi_key_value("thread_id", "=");
+
+            contains!(
+                content,
+                [&format!("{thread_name_prefix}worker-1"), &thread_id_prefix],
+                []
+            );
+        }
+
+        #[test]
+        fn disable_ansi_color() {
+            use tracing::subscriber;
+
+            let mock_writer = MockMakeWriter::new();
+            let subscriber = builder()
+                // disable timestamp so it can be asserted
+                .with_timestamp(false)
+                .with_ansi_color(false)
+                .subscriber_builder()
+                .with_writer(mock_writer.clone())
+                .finish();
+
+            subscriber::with_default(subscriber, || {
+                tracing::info!("message");
+            });
+
+            let content = mock_writer.get_content();
+
+            // assert that there is no ansi color sequences
+            assert_eq!(
+                content,
+                "level=info target=tracing_logfmt::formatter::tests::ansi message=message\n"
+            );
+        }
     }
 }
